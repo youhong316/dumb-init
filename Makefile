@@ -1,52 +1,11 @@
+SHELL=bash
 CFLAGS=-std=gnu99 -static -s -Wall -Werror -O3
 
-TEST_PACKAGE_DEPS := python python-pip procps
+TEST_PACKAGE_DEPS := build-essential python python-pip procps python-dev python-setuptools
 
 DOCKER_RUN_TEST := docker run -v $(PWD):/mnt:ro
+VERSION = $(shell cat VERSION)
 
-# test installation using Debian packages
-DOCKER_DEB_TEST := sh -euxc ' \
-	apt-get update \
-	&& apt-get install -y --no-install-recommends $(TEST_PACKAGE_DEPS) \
-	&& dpkg -i /mnt/dist/*.deb \
-	&& tmp=$$(mktemp -d) \
-	&& cp -r /mnt/* "$$tmp" \
-	&& cd "$$tmp" \
-	&& pip install --upgrade pip \
-	&& /usr/local/bin/pip install --upgrade setuptools distribute \
-	&& /usr/local/bin/pip install -r requirements-dev.txt \
-	&& py.test tests/ \
-	&& exec dumb-init /mnt/tests/test-zombies \
-'
-
-# test installation using `pip install`
-DOCKER_PYTHON_TEST := sh -uexc ' \
-	apt-get update \
-	&& apt-get install -y --no-install-recommends python-pip build-essential $(TEST_PACKAGE_DEPS) \
-	&& tmp=$$(mktemp -d) \
-	&& cp -r /mnt/* "$$tmp" \
-	&& cd "$$tmp" \
-	&& python setup.py clean \
-	&& python setup.py sdist \
-	&& pip install --upgrade pip \
-	&& /usr/local/bin/pip install --upgrade setuptools distribute \
-	&& /usr/local/bin/pip install -vv dist/*.tar.gz \
-	&& /usr/local/bin/pip install -r requirements-dev.txt \
-	&& py.test tests/ \
-	&& exec dumb-init /mnt/tests/test-zombies \
-'
-
-# test several Python versions using tox
-DOCKER_TOX_TEST := sh -uexc ' \
-	apt-key adv --recv-keys --keyserver keyserver.ubuntu.com 0x5BB92C09DB82666C \
-	&& echo "deb http://ppa.launchpad.net/fkrull/deadsnakes/ubuntu trusty main" >> /etc/apt/sources.list \
-	&& apt-get update \
-	&& apt-get install -y --no-install-recommends python2.6 python2.7 python3.4 python-tox build-essential git $(TEST_PACKAGE_DEPS) \
-	&& tmp=$$(mktemp -du) \
-	&& cp -r /mnt "$$tmp" \
-	&& cd "$$tmp" \
-	&& tox \
-'
 .PHONY: build
 build: VERSION.h
 	$(CC) $(CFLAGS) -o dumb-init dumb-init.c
@@ -65,21 +24,32 @@ clean-tox:
 	rm -rf .tox
 
 .PHONY: release
-release: builddeb-docker sdist
-	# extract the built binary from the Debian package
-	dpkg-deb --fsys-tarfile dist/dumb-init_$(shell cat VERSION)_amd64.deb | \
-		tar -C dist --strip=3 -xvf - ./usr/bin/dumb-init
-	mv dist/dumb-init dist/dumb-init_$(shell cat VERSION)_amd64
+release: python-dists
+	cd dist && \
+		sha256sum --binary dumb-init_$(VERSION)_amd64.deb dumb-init_$(VERSION)_amd64 dumb-init_$(VERSION)_ppc64el.deb dumb-init_$(VERSION)_ppc64el \
+		> sha256sums
 
-.PHONY: sdist
-sdist: VERSION.h
+.PHONY: python-dists
+python-dists: VERSION.h
 	python setup.py sdist
+	docker run \
+		--user $$(id -u):$$(id -g) \
+		-v $(PWD)/dist:/dist:rw \
+		quay.io/pypa/manylinux1_x86_64:latest \
+		bash -exc ' \
+			/opt/python/cp35-cp35m/bin/pip wheel --wheel-dir /tmp /dist/*.tar.gz && \
+			auditwheel repair --wheel-dir /dist /tmp/*.whl --wheel-dir /dist \
+		'
 
 .PHONY: builddeb
 builddeb:
 	debuild --set-envvar=CC=musl-gcc -us -uc -b
 	mkdir -p dist
 	mv ../dumb-init_*.deb dist/
+	# Extract the built binary from the Debian package
+	dpkg-deb --fsys-tarfile dist/dumb-init_$(VERSION)_$(shell dpkg --print-architecture).deb | \
+		tar -C dist --strip=3 -xvf - ./usr/bin/dumb-init
+	mv dist/dumb-init dist/dumb-init_$(VERSION)_$(shell dpkg --print-architecture)
 
 .PHONY: builddeb-docker
 builddeb-docker: docker-image
@@ -93,31 +63,30 @@ docker-image:
 .PHONY: test
 test:
 	tox
+	tox -e pre-commit
 
 .PHONY: install-hooks
 install-hooks:
 	tox -e pre-commit -- install -f --install-hooks
 
-.PHONY: itest itest_lucid itest_precise itest_trusty itest_wheezy itest_jessie itest_stretch
-itest: itest_lucid itest_precise itest_trusty itest_wheezy itest_jessie itest_stretch
+ITEST_TARGETS = itest_trusty itest_xenial itest_bionic itest_stretch
 
-itest_lucid: _itest-ubuntu-lucid
-itest_precise: _itest-ubuntu-precise
+.PHONY: itest $(ITEST_TARGETS)
+itest: $(ITEST_TARGETS)
+
 itest_trusty: _itest-ubuntu-trusty
-itest_wheezy: _itest-debian-wheezy
-itest_jessie: _itest-debian-jessie
+itest_xenial: _itest-ubuntu-xenial
+itest_bionic: _itest-ubuntu-bionic
 itest_stretch: _itest-debian-stretch
 
 itest_tox:
-	$(DOCKER_RUN_TEST) ubuntu:trusty $(DOCKER_TOX_TEST)
+	$(DOCKER_RUN_TEST) ubuntu:bionic /mnt/ci/docker-tox-test
 
 _itest-%: _itest_deb-% _itest_python-%
 	@true
 
 _itest_python-%:
-	$(eval DOCKER_IMG := $(shell echo $@ | cut -d- -f2- | sed 's/-/:/'))
-	$(DOCKER_RUN_TEST) $(DOCKER_IMG) $(DOCKER_PYTHON_TEST)
+	$(DOCKER_RUN_TEST) $(shell sed 's/-/:/' <<< "$*") /mnt/ci/docker-python-test
 
 _itest_deb-%: builddeb-docker
-	$(eval DOCKER_IMG := $(shell echo $@ | cut -d- -f2- | sed 's/-/:/'))
-	$(DOCKER_RUN_TEST) $(DOCKER_IMG) $(DOCKER_DEB_TEST)
+	$(DOCKER_RUN_TEST) $(shell sed 's/-/:/' <<< "$*") /mnt/ci/docker-deb-test

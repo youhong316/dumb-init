@@ -1,4 +1,8 @@
+from __future__ import print_function
+
 import os.path
+import subprocess
+import tempfile
 from distutils.command.build import build as orig_build
 from distutils.core import Command
 
@@ -6,6 +10,25 @@ from setuptools import Distribution
 from setuptools import Extension
 from setuptools import setup
 from setuptools.command.install import install as orig_install
+
+
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
+    class bdist_wheel(_bdist_wheel):
+
+        def finalize_options(self):
+            _bdist_wheel.finalize_options(self)
+            # Mark us as not a pure python package
+            self.root_is_pure = False
+
+        def get_tag(self):
+            python, abi, plat = _bdist_wheel.get_tag(self)
+            # We don't contain any python source
+            python, abi = 'py2.py3', 'none'
+            return python, abi, plat
+except ImportError:
+    bdist_wheel = None
 
 
 class ExeDistribution(Distribution):
@@ -65,16 +88,26 @@ class build_cexe(Command):
 
         compiler = new_compiler(verbose=True)
 
+        print('supports -static... ', end='')
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c') as f:
+            f.write('int main(void){}\n')
+            f.flush()
+            cmd = compiler.linker_exe + [f.name, '-static', '-o', os.devnull]
+            with open(os.devnull, 'wb') as devnull:
+                if not subprocess.call(cmd, stderr=devnull):
+                    print('yes')
+                    link_args = ['-static']
+                else:
+                    print('no')
+                    link_args = []
+
         for exe in self.distribution.c_executables:
-            objects = compiler.compile(
-                exe.sources,
-                output_dir=self.build_temp,
-            )
+            objects = compiler.compile(exe.sources, output_dir=self.build_temp)
             compiler.link_executable(
                 objects,
                 exe.name,
                 output_dir=self.build_scripts,
-                extra_postargs=exe.extra_link_args,
+                extra_postargs=link_args,
             )
 
     def get_outputs(self):
@@ -89,15 +122,11 @@ setup(
     description='Simple wrapper script which proxies signals to a child',
     version=open('VERSION').read().strip(),
     author='Yelp',
+    url='https://github.com/Yelp/dumb-init/',
     platforms='linux',
-    c_executables=[
-        Extension(
-            'dumb-init',
-            ['dumb-init.c'],
-            extra_link_args=['-static'],
-        ),
-    ],
+    c_executables=[Extension('dumb-init', ['dumb-init.c'])],
     cmdclass={
+        'bdist_wheel': bdist_wheel,
         'build': build,
         'build_cexe': build_cexe,
         'install': install,

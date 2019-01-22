@@ -1,5 +1,6 @@
 """Sanity checks for command-line options."""
 import re
+import signal
 from subprocess import PIPE
 from subprocess import Popen
 
@@ -11,7 +12,8 @@ def current_version():
     return open('VERSION').read().strip()
 
 
-def test_no_arguments_prints_usage(both_debug_modes, both_setsid_modes):
+@pytest.mark.usefixtures('both_debug_modes', 'both_setsid_modes')
+def test_no_arguments_prints_usage():
     proc = Popen(('dumb-init'), stderr=PIPE)
     _, stderr = proc.communicate()
     assert proc.returncode != 0
@@ -21,8 +23,20 @@ def test_no_arguments_prints_usage(both_debug_modes, both_setsid_modes):
     )
 
 
+@pytest.mark.usefixtures('both_debug_modes', 'both_setsid_modes')
+def test_exits_invalid_with_invalid_args():
+    proc = Popen(('dumb-init', '--yolo', '/bin/true'), stderr=PIPE)
+    _, stderr = proc.communicate()
+    assert proc.returncode == 1
+    assert stderr in (
+        b"dumb-init: unrecognized option '--yolo'\n",  # glibc
+        b'dumb-init: unrecognized option: yolo\n',  # musl
+    )
+
+
 @pytest.mark.parametrize('flag', ['-h', '--help'])
-def test_help_message(flag, both_debug_modes, both_setsid_modes, current_version):
+@pytest.mark.usefixtures('both_debug_modes', 'both_setsid_modes')
+def test_help_message(flag, current_version):
     """dumb-init should say something useful when called with the help flag,
     and exit zero.
     """
@@ -40,6 +54,9 @@ def test_help_message(flag, both_debug_modes, both_setsid_modes, current_version
         b'   -c, --single-child   Run in single-child mode.\n'
         b'                        In this mode, signals are only proxied to the\n'
         b'                        direct child and not any of its descendants.\n'
+        b'   -r, --rewrite s:r    Rewrite received signal s to new signal r before proxying.\n'
+        b'                        To ignore (not proxy) a signal, rewrite it to 0.\n'
+        b'                        This option can be specified multiple times.\n'
         b'   -v, --verbose        Print debugging information to stderr.\n'
         b'   -h, --help           Print this help message and exit.\n'
         b'   -V, --version        Print the current version and exit.\n'
@@ -49,7 +66,8 @@ def test_help_message(flag, both_debug_modes, both_setsid_modes, current_version
 
 
 @pytest.mark.parametrize('flag', ['-V', '--version'])
-def test_version_message(flag, both_debug_modes, both_setsid_modes, current_version):
+@pytest.mark.usefixtures('both_debug_modes', 'both_setsid_modes')
+def test_version_message(flag, current_version):
     """dumb-init should print its version when asked to."""
 
     proc = Popen(('dumb-init', flag), stderr=PIPE)
@@ -65,16 +83,21 @@ def test_verbose(flag):
     stdout, stderr = proc.communicate()
     assert proc.returncode == 0
     assert stdout == b'oh, hi\n'
-    assert re.match(
+
+    # child/parent race to print output after the fork(), can't guarantee exact order
+    assert re.search(b'(^|\n)\[dumb-init\] setsid complete\.\n', stderr), stderr  # child
+    assert re.search(  # parent
         (
-            b'^\[dumb-init\] Child spawned with PID [0-9]+\.\n'
-            b'\[dumb-init\] setsid complete\.\n'
-            b'\[dumb-init\] A child with PID [0-9]+ exited with exit status 0.\n'
-            b'\[dumb-init\] Forwarded signal 15 to children\.\n'
-            b'\[dumb-init\] Child exited with status 0\. Goodbye\.\n$'
-        ),
+            '(^|\n)\[dumb-init\] Child spawned with PID [0-9]+\.\n'
+            '.*'  # child might print here
+            '\[dumb-init\] Received signal {signal.SIGCHLD}\.\n'
+            '\[dumb-init\] A child with PID [0-9]+ exited with exit status 0.\n'
+            '\[dumb-init\] Forwarded signal 15 to children\.\n'
+            '\[dumb-init\] Child exited with status 0\. Goodbye\.\n$'
+        ).format(signal=signal).encode('utf8'),
         stderr,
-    )
+        re.DOTALL,
+    ), stderr
 
 
 @pytest.mark.parametrize('flag1', ['-v', '--verbose'])
@@ -87,10 +110,39 @@ def test_verbose_and_single_child(flag1, flag2):
     assert stdout == b'oh, hi\n'
     assert re.match(
         (
-            b'^\[dumb-init\] Child spawned with PID [0-9]+\.\n'
-            b'\[dumb-init\] A child with PID [0-9]+ exited with exit status 0.\n'
-            b'\[dumb-init\] Forwarded signal 15 to children\.\n'
-            b'\[dumb-init\] Child exited with status 0\. Goodbye\.\n$'
-        ),
+            '^\[dumb-init\] Child spawned with PID [0-9]+\.\n'
+            '\[dumb-init\] Received signal {signal.SIGCHLD}\.\n'
+            '\[dumb-init\] A child with PID [0-9]+ exited with exit status 0.\n'
+            '\[dumb-init\] Forwarded signal 15 to children\.\n'
+            '\[dumb-init\] Child exited with status 0\. Goodbye\.\n$'
+        ).format(signal=signal).encode('utf8'),
         stderr,
+    )
+
+
+@pytest.mark.parametrize('extra_args', [
+    ('-r',),
+    ('-r', ''),
+    ('-r', 'herp'),
+    ('-r', 'herp:derp'),
+    ('-r', '15'),
+    ('-r', '15::12'),
+    ('-r', '15:derp'),
+    ('-r', '15:12', '-r'),
+    ('-r', '15:12', '-r', '0'),
+    ('-r', '15:12', '-r', '1:32'),
+])
+@pytest.mark.usefixtures('both_debug_modes', 'both_setsid_modes')
+def test_rewrite_errors(extra_args):
+    proc = Popen(
+        ('dumb-init',) + extra_args + ('echo', 'oh,', 'hi'),
+        stdout=PIPE, stderr=PIPE,
+    )
+    stdout, stderr = proc.communicate()
+    assert proc.returncode == 1
+    assert stderr == (
+        b'Usage: -r option takes <signum>:<signum>, where <signum> '
+        b'is between 1 and 31.\n'
+        b'This option can be specified multiple times.\n'
+        b'Use --help for full usage.\n'
     )

@@ -1,14 +1,22 @@
-FROM debian:jessie
+FROM debian:stretch
 
-MAINTAINER Chris Kuehl <ckuehl@yelp.com>
+LABEL maintainer="Chris Kuehl <ckuehl@yelp.com>"
+
+# The default mirrors are too flaky to run reliably in CI.
+RUN sed -E \
+    '/security\.debian/! s@http://[^/]+/@http://mirrors.kernel.org/@' \
+    -i /etc/apt/sources.list
 
 # Install the bare minimum dependencies necessary for working with Debian
 # packages. Build dependencies should be added under "Build-Depends" inside
 # debian/control instead.
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential devscripts equivs musl-tools python python-pytest python-mock && \
-    rm -rf /var/lib/apt/lists/* && apt-get clean
+        build-essential \
+        devscripts \
+        equivs \
+        lintian \
+    && rm -rf /var/lib/apt/lists/* && apt-get clean
 WORKDIR /mnt
 
 ENTRYPOINT apt-get update && \
